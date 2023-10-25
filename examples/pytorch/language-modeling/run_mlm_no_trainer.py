@@ -40,6 +40,8 @@ from datasets import load_dataset
 from huggingface_hub import Repository, create_repo
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+from nltk.tokenize import sent_tokenize
+from torch import nn
 
 import transformers
 from transformers import (
@@ -161,6 +163,7 @@ def parse_args():
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default=None, help="Where to store the final model.")
+    parser.add_argument("--reg_lambda", type=float, default=0, help="Weight for attention regularization.")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--model_type",
@@ -265,6 +268,61 @@ def parse_args():
             raise ValueError("Need an `output_dir` to create a repo when `--push_to_hub` is passed.")
 
     return args
+
+
+def _number_sentences(input_ids):
+    """Give all tokens in the same sentence the same number.
+
+    The first token with a given number corresponds to the register token for that sentence
+
+    input_ids: # 1D torch.Tensor
+    """
+    seq_length = len(input_ids)
+    seq_mask = input_ids == 2
+    sent_bound = seq_mask.nonzero(as_tuple=True)[0]
+    sentence_ids = [[i] * (sent_bound[i + 1] - sent_bound[i]) for i in range(len(sent_bound) - 1)]
+    sentence_ids += [[len(sent_bound) - 1] * (seq_length - sent_bound[-1])]
+    return sum(sentence_ids, [])  # Flatten
+
+
+def _create_2d_mask(input_ids):
+    seq_length = len(input_ids)
+    sentence_ids = _number_sentences(input_ids)
+
+    # Initialize mask to 1 (penalize all attentions initially)
+    mask_2d = torch.ones((seq_length, seq_length), dtype=torch.bool)
+
+    # Allow within-sentence attention
+    sentence_ids_tensor = torch.tensor(sentence_ids)
+    within_sentence_mask = sentence_ids_tensor[:, None] == sentence_ids_tensor[None, :]
+    mask_2d[within_sentence_mask] = 0
+
+    # Allow attention to register tokens from any token
+    register_positions = (input_ids == 2).nonzero(as_tuple=True)[0]
+    mask_2d[:, register_positions] = 0
+
+    return mask_2d
+
+
+def compute_attention_loss(batch, attention_weights):
+    """
+    - Tokens with the same number can attend to each other freely: the mask value is 0.
+    - Tokens can also attend to the first token with any given number freely
+        (i.e. they can attend to the register token): the mask value is also 0.
+    - Other token pairs incur a penalty: the mask value is 1.
+    """
+    device = batch.input_ids.device
+    # Get masks
+    batch_mask = torch.stack([_create_2d_mask(seq) for seq in batch.input_ids])  # [8, 512, 512]
+    broadcastable_mask = batch_mask.unsqueeze(1).to(device)  # [8, 1, 512, 512]
+    # Compute loss
+    target = torch.zeros_like(attention_weights[0])
+    losses_per_layer = [nn.functional.mse_loss(weights * ~broadcastable_mask, target)
+                        for weights in attention_weights]
+    losses_per_layer = torch.Tensor(losses_per_layer).to(device)
+    # Linearly increase penalty with each layer
+    weights = torch.arange(0, 1.0001, 1 / 12, device=device)[1:]
+    return (losses_per_layer * weights).sum()
 
 
 def main():
@@ -440,6 +498,7 @@ def main():
         max_seq_length = min(args.max_seq_length, tokenizer.model_max_length)
 
     if args.line_by_line:
+        raise ValueError("I wasn't expecting line-by-line...")
         # When using line_by_line, we just tokenize each nonempty line.
         padding = "max_length" if args.pad_to_max_length else False
 
@@ -472,7 +531,21 @@ def main():
         # We use `return_special_tokens_mask=True` because DataCollatorForLanguageModeling (see below) is more
         # efficient when it receives the `special_tokens_mask`.
         def tokenize_function(examples):
-            return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
+            # Remove empty lines
+            examples[text_column_name] = [
+                line for line in examples[text_column_name] if len(line) > 0 and not line.isspace()
+            ]
+            example_sentences = [sent_tokenize(example) for example in examples[text_column_name]]
+            examples = [tokenizer.sep_token.join(sentences) for sentences in example_sentences]
+
+            tmp_tokenized_dataset = tokenizer(examples, return_special_tokens_mask=True)
+            # return_special_tokens_mask doesn't work with special tokens already in the text.
+            # So we have to overwrite it using `tokenizer.get_special_tokens_mask`
+            # See https://github.com/huggingface/tokenizers/issues/790
+            masks = [tokenizer.get_special_tokens_mask(input_ids, already_has_special_tokens=True)
+                     for input_ids in tmp_tokenized_dataset.input_ids]
+            tmp_tokenized_dataset['special_tokens_mask'] = masks
+            return tmp_tokenized_dataset
 
         with accelerator.main_process_first():
             tokenized_datasets = raw_datasets.map(
@@ -488,16 +561,29 @@ def main():
         # max_seq_length.
         def group_texts(examples):
             # Concatenate all texts.
+            # Keys are e.g. `input_ids`, etc.
             concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
-            total_length = len(concatenated_examples[list(examples.keys())[0]])
+            all_keys = list(examples.keys())
+            input_ids_key = all_keys[0]
+            total_length = len(concatenated_examples[input_ids_key])  # All values have the same length
             # We drop the small remainder, and if the total_length < max_seq_length  we exclude this batch and return an empty dict.
             # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
-            total_length = (total_length // max_seq_length) * max_seq_length
-            # Split by chunks of max_len.
-            result = {
-                k: [t[i : i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                for k, t in concatenated_examples.items()
-            }
+            pos = 0
+            result = {k: [] for k in all_keys}
+            while True:
+                if total_length < pos + max_seq_length:
+                    break
+                first_token = concatenated_examples[input_ids_key][pos]
+                if first_token == tokenizer.sep_token_id:
+                    for k in all_keys:
+                        result[k].append(concatenated_examples[k][pos:pos + max_seq_length])
+                    pos += max_seq_length
+                else:
+                    result[input_ids_key].append(
+                        [tokenizer.sep_token_id] + concatenated_examples[input_ids_key][pos:pos + max_seq_length - 1])
+                    for k in all_keys[1:]:
+                        result[k].append([1] + concatenated_examples[k][pos:pos + max_seq_length - 1])
+                    pos += max_seq_length - 1
             return result
 
         # Note that with `batched=True`, this map processes 1,000 texts together, so group_texts throws away a
@@ -646,7 +732,8 @@ def main():
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
-            total_loss = 0
+            lm_total_loss = 0
+            reg_total_loss = 0
         if args.resume_from_checkpoint and epoch == starting_epoch and resume_step is not None:
             # We skip the first `n` batches in the dataloader when resuming from a checkpoint
             active_dataloader = accelerator.skip_first_batches(train_dataloader, resume_step)
@@ -654,11 +741,15 @@ def main():
             active_dataloader = train_dataloader
         for step, batch in enumerate(active_dataloader):
             with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
+                outputs = model(**batch, output_attentions=True)
+                attention_weights = outputs.attentions  # batch x num_heads x seq_len x seq_len
+                lm_loss = outputs.loss
+                reg_loss = compute_attention_loss(batch, attention_weights)
+                loss = lm_loss + args.reg_lambda * reg_loss
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
-                    total_loss += loss.detach().float()
+                    lm_total_loss += lm_loss.detach().float()
+                    reg_total_loss += reg_loss.detach().float()
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
@@ -702,7 +793,9 @@ def main():
                 {
                     "perplexity": perplexity,
                     "eval_loss": eval_loss,
-                    "train_loss": total_loss.item() / len(train_dataloader),
+                    "lm_loss": lm_total_loss.item() / len(train_dataloader),
+                    "reg_total_loss": reg_total_loss.item() / len(train_dataloader),
+                    "train_loss": (lm_total_loss.item() + reg_total_loss.item()) / len(train_dataloader),
                     "epoch": epoch,
                     "step": completed_steps,
                 },
