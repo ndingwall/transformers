@@ -231,6 +231,12 @@ def parse_args():
         help="Whether to enable experiment trackers for logging.",
     )
     parser.add_argument(
+        "--log_steps",
+        type=int,
+        default=None,
+        help="How often to log losses for tracking. Requires `--with_tracking`.",
+    )
+    parser.add_argument(
         "--report_to",
         type=str,
         default="all",
@@ -750,6 +756,18 @@ def main():
                 if args.with_tracking:
                     lm_total_loss += lm_loss.detach().float()
                     reg_total_loss += reg_loss.detach().float()
+                    if args.log_steps and ((step + 1) % args.log_steps == 0):
+                        total_loss = lm_total_loss.item() + args.reg_lambda * reg_total_loss.item()
+                        accelerator.log(
+                            {
+                                "lm_loss": lm_total_loss.item() / len(train_dataloader),
+                                "reg_total_loss": reg_total_loss.item() / len(train_dataloader),
+                                "train_loss": total_loss / len(train_dataloader),
+                                "epoch": epoch,
+                                "step": completed_steps,
+                            },
+                            step=completed_steps,
+                        )
                 accelerator.backward(loss)
                 optimizer.step()
                 lr_scheduler.step()
@@ -789,13 +807,14 @@ def main():
         logger.info(f"epoch {epoch}: perplexity: {perplexity} eval_loss: {eval_loss}")
 
         if args.with_tracking:
+            total_loss = lm_total_loss.item() + args.reg_lambda * reg_total_loss.item()
             accelerator.log(
                 {
                     "perplexity": perplexity,
                     "eval_loss": eval_loss,
                     "lm_loss": lm_total_loss.item() / len(train_dataloader),
                     "reg_total_loss": reg_total_loss.item() / len(train_dataloader),
-                    "train_loss": (lm_total_loss.item() + reg_total_loss.item()) / len(train_dataloader),
+                    "train_loss": total_loss / len(train_dataloader),
                     "epoch": epoch,
                     "step": completed_steps,
                 },
